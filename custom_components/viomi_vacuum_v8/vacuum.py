@@ -53,11 +53,15 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 SERVICE_CLEAN_ZONE = "clean_zone"
 SERVICE_CLEAN_AREA = "clean_area"
 SERVICE_CLEAN_POINT = "clean_point"
+SERVICE_CLEAN_SEGMENT = "clean_segment"
+SERVICE_OBS_CLEAN_ZONE = "xiaomi_clean_zone"
+SERVICE_OBS_CLEAN_POINT = "xiaomi_clean_point"
 ATTR_ZONE_ARRAY = "zone"
 ATTR_ZONE_REPEATER = "repeats"
 ATTR_AREA_ARRAY = "area"
 ATTR_AREA_REPEATER = "repeats"
 ATTR_POINT = "point"
+ATTR_SEGMENTS = "segments"
 
 VACUUM_SERVICE_SCHEMA = vol.Schema({vol.Optional(ATTR_ENTITY_ID): cv.comp_entity_ids})
 SERVICE_SCHEMA_CLEAN_ZONE = VACUUM_SERVICE_SCHEMA.extend(
@@ -99,6 +103,14 @@ SERVICE_SCHEMA_CLEAN_POINT = VACUUM_SERVICE_SCHEMA.extend(
         )
     }
 )
+SERVICE_SCHEMA_CLEAN_SEGMENT = VACUUM_SERVICE_SCHEMA.extend(
+    {
+        vol.Required(ATTR_SEGMENTS): vol.Any(
+            vol.Coerce(int),
+            [vol.Coerce(int)]
+        ),
+    }
+)
 
 SERVICE_TO_METHOD = {
     SERVICE_CLEAN_ZONE: {
@@ -110,6 +122,18 @@ SERVICE_TO_METHOD = {
         "schema": SERVICE_SCHEMA_CLEAN_AREA,
     },
     SERVICE_CLEAN_POINT: {
+        "method": "async_clean_point",
+        "schema": SERVICE_SCHEMA_CLEAN_POINT,
+    },
+    SERVICE_CLEAN_SEGMENT: {
+        "method": "async_clean_segment",
+        "schema": SERVICE_SCHEMA_CLEAN_SEGMENT,
+    },
+    SERVICE_OBS_CLEAN_ZONE: {
+        "method": "async_clean_zone",
+        "schema": SERVICE_SCHEMA_CLEAN_ZONE,
+    },
+    SERVICE_OBS_CLEAN_POINT: {
         "method": "async_clean_point",
         "schema": SERVICE_SCHEMA_CLEAN_POINT,
     }
@@ -144,7 +168,7 @@ ALL_PROPS = [
     "run_state",
     "mode",
     "err_state",
-    "battary_life",
+    "battery_life",
     "box_type",
     "mop_type",
     "s_time",
@@ -184,14 +208,8 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     # Create handler
     _LOGGER.info("Initializing with host %s (token %s...)", host, token[:5])
 
-    try:
-        miio_device = Device(host, token)
-        device_info = miio_device.info()
-    except DeviceException:
-        raise PlatformNotReady
-
     vacuum = Vacuum(host, token)
-    device = ViomiVacuumRobot(name, vacuum)
+    device = ViomiVacuumEntity(name, vacuum)
     hass.data[DATA_KEY][host] = device
 
     async_add_entities([device], update_before_add=True)
@@ -223,7 +241,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         )
 
 
-class ViomiVacuumRobot(StateVacuumEntity):
+class ViomiVacuumEntity(StateVacuumEntity):
     """Representation of a Viomi Vacuum V8 robot."""
 
     def __init__(self, name, vacuum):
@@ -261,7 +279,7 @@ class ViomiVacuumRobot(StateVacuumEntity):
     def battery_level(self):
         """Return the battery level of the device."""
         if self.vacuum_state is not None:
-            return self.vacuum_state['battary_life']
+            return self.vacuum_state['battery_life']
 
     @property
     def fan_speed(self):
@@ -430,20 +448,37 @@ class ViomiVacuumRobot(StateVacuumEntity):
 
             self._available = True
 
-            # Automatically set mop based on box_type
-            is_mop = int(self.vacuum_state['is_mop'])
+            # Current state of the vacuum
+            # 2: mop only, 1: dust&mop, 0: only vacuum
+            current_mode = int(self.vacuum_state['is_mop'])
+
+            # 3: 2 in 1, 2: water only, 1: dust only, 0: no box
             box_type = int(self.vacuum_state['box_type'])
 
-            update_mop = None
-            if box_type == 2 and is_mop != 2:
-                update_mop = 2
-            elif box_type == 3 and is_mop != 1:
-                update_mop = 1
-            elif box_type == 1 and is_mop != 0:
-                update_mop = 0
+            # True: has the mop attachment, False: no attachment
+            has_mop = bool(self.vacuum_state['mop_type'])
 
-            if update_mop is not None:
-                self._vacuum.raw_command('set_mop', [update_mop])
+            # Automatically set mop based on box_type
+            new_mode = None
+
+            if box_type == 3:
+                # 2 in 1 box
+                if has_mop:
+                    # Vacuum and mop if we have the attachment
+                    new_mode = 1
+                else:
+                    # Just vacuum if we have no mop
+                    new_mode = 0
+            elif box_type == 2:
+                # We only have water, so let's mop.
+                # (Vacuum will error out if we have no mop attachment)
+                new_mode = 2
+            elif box_type == 1:
+                # We only have dust box, mopping not possible
+                new_mode = 0
+
+            if new_mode is not None and new_mode != current_mode:
+                self._vacuum.raw_command('set_mop', [new_mode])
                 self.update()
         except OSError as exc:
             _LOGGER.error("Got OSError while fetching the state: %s", exc)
@@ -451,7 +486,7 @@ class ViomiVacuumRobot(StateVacuumEntity):
             _LOGGER.warning("Got exception while fetching the state: %s", exc)
 
     async def async_clean_zone(self, zone, repeats=1):
-        """Clean selected area for the number of repeats indicated."""
+        """Clean selected zone for the number of repeats indicated."""
         result = []
         i = 0
         for z in zone:
@@ -490,3 +525,11 @@ class ViomiVacuumRobot(StateVacuumEntity):
         self._last_clean_point = point
         await self._try_command("Unable to clean point: %s", self._vacuum.raw_command, 'set_uploadmap', [0]) \
             and await self._try_command("Unable to clean point: %s", self._vacuum.raw_command, 'set_pointclean', [1, x, y])
+
+    async def async_clean_segment(self, segments):
+        """Clean selected segment(s) (rooms)"""
+        if isinstance(segments, int):
+            segments = [segments]
+
+        await self._try_command("Unable to clean segments: %s", self._vacuum.raw_command, 'set_uploadmap', [1]) \
+            and await self._try_command("Unable to clean segments: %s", self._vacuum.raw_command, 'set_mode_withroom', [0, 1, len(segments)] + segments)
